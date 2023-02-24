@@ -97,3 +97,16 @@ class Keys:
     boxes3d = "boxes3d"
     boxes3d_classes = "boxes3d_classes"
     boxes3d_track_ids = "boxes3d_track_ids"
+
+class WeathersCoarse:
+    clear = "clear"
+    cloudy = "cloudy"
+    overcast = "overcast"
+    rainy = "rainy"
+    foggy = "foggy"
+
+class TimesOfDayCoarse:
+    daytime = "daytime"
+    dawn_dusk = "dawn/dusk"
+    night = "night"
+
