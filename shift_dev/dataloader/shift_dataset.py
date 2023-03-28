@@ -36,18 +36,6 @@ def _get_extension(backend: DataBackend):
     return ""
 
 
-def filter_domains(raw_frame,
-                   weather_coarse: List[WeathersCoarse] = None,
-                   timeofday_coarse: List[TimesOfDayCoarse] = None) -> bool:
-    if weather_coarse is not None and raw_frame['attributes']['weather_coarse'] not in weather_coarse:
-        return False
-
-    if timeofday_coarse is not None and raw_frame['attributes']['timeofday_coarse'] not in timeofday_coarse:
-        return False
-
-    return True
-
-
 class _SHIFTScalabelLabels(Scalabel):
     """Helper class for labels in SHIFT that are stored in Scalabel format."""
 
@@ -73,8 +61,8 @@ class _SHIFTScalabelLabels(Scalabel):
         backend: DataBackend = HDF5Backend(),
         verbose: bool = False,
         num_workers: int = 1,
-        weather_coarse: List[WeathersCoarseCoarse] = None,
-        timeofday_coarse: List[TimesOfDayCoarse] = None,
+        weathers_coarse: List[WeathersCoarseCoarse] = None,
+        timeofdays_coarse: List[TimesOfDayCoarse] = None,
         **kwargs,
     ) -> None:
         """Initialize SHIFT dataset for one view.
@@ -90,8 +78,8 @@ class _SHIFTScalabelLabels(Scalabel):
         """
         self.verbose = verbose
         self.num_workers = num_workers
-        self.weather_coarse = weather_coarse
-        self.timeofday_coarse = timeofday_coarse
+        self.weathers_coarse = weathers_coarse
+        self.timeofdays_coarse = timeofdays_coarse
 
         # Validate input
         assert split in set(("train", "val", "test")), f"Invalid split '{split}'"
@@ -161,7 +149,7 @@ class _SHIFTScalabelLabels(Scalabel):
             config = Config(**cfg)
 
         parse_ = partial(parse, validate_frames=False)
-        filter_ = partial(filter_domains, weather_coarse=self.weather_coarse, timeofday_coarse=self.timeofday_coarse)
+        filter_ = partial(self._filter_domains)
         filtered_frames = list(filter(filter_, raw_frames))
         if self.num_workers > 1:
             with multiprocessing.Pool(self.num_workers) as pool:
@@ -173,6 +161,17 @@ class _SHIFTScalabelLabels(Scalabel):
         else:
             frames = list(map(parse_, filtered_frames))
         return ScalabelData(frames=frames, config=config)
+
+    def _filter_domains(self, raw_frame):
+        if self.weathers_coarse is not None and \
+                raw_frame['attributes']['weather_coarse'] not in self.weathers_coarse:
+            return False
+
+        if self.timeofdays_coarse is not None and \
+                raw_frame['attributes']['timeofday_coarse'] not in self.timeofdays_coarse:
+            return False
+
+        return True
 
 
 class SHIFTDataset(Dataset):
@@ -263,8 +262,6 @@ class SHIFTDataset(Dataset):
         split: str,
         keys_to_load: Sequence[str] = (Keys.images, Keys.boxes2d),
         views_to_load: Sequence[str] = ("front",),
-        framerate: str = "images",
-        shift_type: str = "discrete",
         backend: DataBackend = HDF5Backend(),
         num_workers: int = 1,
         verbose: bool = False,
@@ -273,11 +270,6 @@ class SHIFTDataset(Dataset):
         """Initialize SHIFT dataset."""
         # Validate input
         assert split in {"train", "val", "test"}, f"Invalid split '{split}'."
-        assert framerate in {"images", "videos"}, f"Invalid framerate '{framerate}'. Must be 'images' or 'videos'."
-        assert shift_type in {"discrete", "continuous/1x", "continuous/10x", "continuous/100x"}, (
-            f"Invalid shift_type '{shift_type}'. Must be one of 'discrete', 'continuous/1x', 'continuous/10x', "
-            "or 'continuous/100x'."
-        )
         self.validate_keys(keys_to_load)
 
         # Set attributes
@@ -285,8 +277,6 @@ class SHIFTDataset(Dataset):
         self.split = split
         self.keys_to_load = keys_to_load
         self.views_to_load = views_to_load
-        self.framerate = framerate
-        self.shift_type = shift_type
         self.backend = backend
         self.verbose = verbose
         self.ext = _get_extension(backend)
@@ -482,25 +472,7 @@ class SHIFTDataset(Dataset):
                     data_dict_view[Keys.optical_flows] = self._load(
                         view, "flow", "npz", video_name, frame_name
                     )
-            
+
             data_dict[view] = data_dict_view
 
         return data_dict
-
-    @property
-    def video_to_indices(self) -> dict[str, list[int]]:
-        """Group all dataset sample indices (int) by their video ID (str).
-
-        Returns:
-            dict[str, list[int]]: Mapping video to index.
-        """
-        if len(self.scalabel_datasets) > 0:
-            return self.scalabel_datasets[list(self.scalabel_datasets.keys())[0]].video_to_indices
-        raise ValueError("No Scalabel file has been loaded.")
-
-    def get_video_indices(self, idx: int) -> list[int]:
-        """Get all dataset indices in a video given a single dataset index."""
-        for indices in self.video_to_indices.values():
-            if idx in indices:
-                return indices
-        raise ValueError(f"Dataset index {idx} not found in video_to_indices!")
