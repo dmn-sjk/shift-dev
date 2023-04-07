@@ -28,6 +28,7 @@ from shift_dev.types import DataDict, DictStrAny, Keys, NDArrayU8
 from shift_dev.utils import Timer, setup_logger
 from shift_dev.utils.backend import DataBackend, FileBackend
 from shift_dev.utils.load import im_decode, ply_decode
+from shift_dev.utils.classification_crop import get_cropped_object_image
 
 from .cache import CacheMappingMixin, DatasetFromList
 
@@ -163,6 +164,8 @@ class Scalabel(Dataset, CacheMappingMixin):
         global_instance_ids: bool = False,
         bg_as_class: bool = False,
         use_cache: bool = False,
+        classification: bool = False,
+        classification_img_size: int = 64,
     ) -> None:
         """Creates an instance of the class.
 
@@ -195,6 +198,8 @@ class Scalabel(Dataset, CacheMappingMixin):
         self.use_cache = use_cache
         self.data_backend = data_backend if data_backend is not None else FileBackend()
         self.config_path = config_path
+        self.classification = classification
+        self.classification_img_size = classification_img_size
         self.frames, self.cfg = self._load_mapping(self._generate_mapping, use_cache)
 
         assert self.cfg is not None, (
@@ -251,9 +256,14 @@ class Scalabel(Dataset, CacheMappingMixin):
         data: DictData = {}
         if frame.url is not None and Keys.images in self.keys_to_load:
             image = load_image(frame.url, self.data_backend)
+            if self.classification:
+                image = get_cropped_object_image(image, 
+                                                 frame.labels[0].box2d, 
+                                                 (self.cfg.imageSize),
+                                                 self.classification_img_size)
             input_hw = (image.shape[2], image.shape[3])
             data[Keys.images] = image
-            data[Keys.original_hw] = input_hw
+            data[Keys.original_hw] = (self.cfg.imageSize.height, self.cfg.imageSize.width)
             data[Keys.input_hw] = input_hw
             data[Keys.frame_ids] = frame.frameIndex
             # TODO how to properly integrate such metadata?
@@ -295,9 +305,15 @@ class Scalabel(Dataset, CacheMappingMixin):
             boxes2d, classes, track_ids = boxes2d_from_scalabel(
                 labels_used, cats_name2id, instid_map
             )
-            data[Keys.boxes2d] = boxes2d
-            data[Keys.boxes2d_classes] = classes
-            data[Keys.boxes2d_track_ids] = track_ids
+            if self.classification:
+                # squeeze dimension since there is only one object in each image
+                data[Keys.boxes2d] = boxes2d[0]
+                data[Keys.boxes2d_classes] = classes[0]
+                data[Keys.boxes2d_track_ids] = track_ids[0]
+            else:
+                data[Keys.boxes2d] = boxes2d
+                data[Keys.boxes2d_classes] = classes
+                data[Keys.boxes2d_track_ids] = track_ids
 
         if Keys.masks in self.keys_to_load:
             # NOTE: instance masks' mapping is consistent with boxes2d

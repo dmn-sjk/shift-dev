@@ -12,7 +12,20 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from scalabel.label.io import parse
-from scalabel.label.typing import Config
+from scalabel.label.typing import (
+    Config,
+    RLE, 
+    Box2D, 
+    Box3D, 
+    Extrinsics, 
+    Frame, 
+    Graph, 
+    ImageSize, 
+    Intrinsics, 
+    Label, 
+    Poly2D
+)
+    
 from scalabel.label.typing import Dataset as ScalabelData
 from torch import Tensor
 from torch.utils.data import Dataset
@@ -23,6 +36,11 @@ from shift_dev.utils.backend import DataBackend, HDF5Backend, ZipBackend
 from shift_dev.utils.load import im_decode, ply_decode
 
 from .base import Scalabel
+
+from typing import List, Optional
+from scalabel.common.typing import DictStrAny
+
+from shift_dev.utils.classification_crop import get_bbox_size
 
 logger = setup_logger()
 
@@ -60,9 +78,11 @@ class _SHIFTScalabelLabels(Scalabel):
         shift_type: str = "discrete",
         backend: DataBackend = HDF5Backend(),
         verbose: bool = False,
+        classification: bool = False,
         num_workers: int = 1,
-        weathers_coarse: List[WeathersCoarseCoarse] = None,
+        weathers_coarse: List[WeathersCoarse] = None,
         timeofdays_coarse: List[TimesOfDayCoarse] = None,
+        min_bbox_size: int = 1024,
         **kwargs,
     ) -> None:
         """Initialize SHIFT dataset for one view.
@@ -77,9 +97,11 @@ class _SHIFTScalabelLabels(Scalabel):
                 HDF5Backend().
         """
         self.verbose = verbose
+        self.classification = classification
         self.num_workers = num_workers
         self.weathers_coarse = weathers_coarse
         self.timeofdays_coarse = timeofdays_coarse
+        self.min_bbox_size = min_bbox_size
 
         # Validate input
         assert split in set(("train", "val", "test")), f"Invalid split '{split}'"
@@ -102,7 +124,7 @@ class _SHIFTScalabelLabels(Scalabel):
             data_path = os.path.join(
                 data_root, "discrete", framerate, split, view, f"{data_file}{ext}"
             )
-        super().__init__(data_path, annotation_path, data_backend=backend, **kwargs)
+        super().__init__(data_path, annotation_path, data_backend=backend, classification=classification, **kwargs)
 
     def _generate_mapping(self) -> ScalabelData:
         """Generate data mapping."""
@@ -148,21 +170,49 @@ class _SHIFTScalabelLabels(Scalabel):
         if cfg is not None:
             config = Config(**cfg)
 
-        parse_ = partial(parse, validate_frames=False)
-        filter_ = partial(self._filter_domains)
-        filtered_frames = list(filter(filter_, raw_frames))
+        filter_domains_ = partial(self._filter_domains)
+        filtered_frames = list(filter(filter_domains_, tqdm(raw_frames, desc="Filtering domains...")))
+        
+        if self.classification:
+            filter_bbox_size_ = partial(self._filter_bbox_size)
+            
+            with tqdm(total=len(filtered_frames), desc="Filtering bboxes by size...") as pbar:
+                # reversed because deleting elements from the iterated iterable
+                for i in reversed(range(len(filtered_frames))):
+                    filtered_labels = list(filter(filter_bbox_size_, filtered_frames[i]["labels"]))
+                    if len(filtered_labels) == 0:
+                        del filtered_frames[i]
+                    else:
+                        filtered_frames[i]["labels"] = filtered_labels
+                    pbar.update()
+                
+            parse_func = self._parse_labels_for_classification
+        else:
+            parse_func = parse
+            
+        parse_ = partial(parse_func, validate_frames=False)
+        
         if self.num_workers > 1:
             with multiprocessing.Pool(self.num_workers) as pool:
                 frames = []
                 with tqdm(total=len(filtered_frames)) as pbar:
                     for result in pool.imap_unordered(parse_, filtered_frames, chunksize=1000):
-                        frames.append(result)
+                        if self.classification:
+                            frames.extend(result)
+                        else:
+                            frames.append(result)
                         pbar.update()
         else:
-            frames = list(map(parse_, filtered_frames))
+            if self.classification:
+                # reduce the dimensionality since it outputs multiple frames from one frame (kinda extend instead of append)
+                frames = list([frame for frames in map(parse_, tqdm(filtered_frames, desc="Parsing frames...")) for frame in frames])
+            else:
+                frames = list(map(parse_, tqdm(filtered_frames, desc="Parsing frames...")))
+                
+            
         return ScalabelData(frames=frames, config=config)
 
-    def _filter_domains(self, raw_frame):
+    def _filter_domains(self, raw_frame: List[DictStrAny]) -> bool:
         if self.weathers_coarse is not None and \
                 raw_frame['attributes']['weather_coarse'] not in self.weathers_coarse:
             return False
@@ -170,8 +220,57 @@ class _SHIFTScalabelLabels(Scalabel):
         if self.timeofdays_coarse is not None and \
                 raw_frame['attributes']['timeofday_coarse'] not in self.timeofdays_coarse:
             return False
-
         return True
+    
+    def _filter_bbox_size(self, label: DictStrAny) -> bool:
+        bbox = Box2D.construct(**label["box2d"])
+        if self.min_bbox_size > get_bbox_size(bbox):
+            return False
+        return True
+
+    def _parse_labels_for_classification(self, raw_frame: DictStrAny, validate_frames: bool = True) -> Frame:
+        """Parse a single frame with multiple objects to multiple frames with single object."""
+        frames = []
+        for single_label in raw_frame["labels"]:
+            if not validate_frames:
+                # ignore the construct arguments in mypy, add type ignores
+                frame = Frame.construct(**raw_frame)
+                if frame.intrinsics is not None:
+                    # type: ignore # pylint: disable=line-too-long
+                    frame.intrinsics = Intrinsics.construct(**frame.intrinsics)
+                if frame.extrinsics is not None:
+                    # type: ignore # pylint: disable=line-too-long
+                    frame.extrinsics = Extrinsics.construct(**frame.extrinsics)
+                if frame.size is not None:
+                    # type: ignore # pylint: disable=line-too-long
+                    frame.size = ImageSize.construct(**frame.size)
+                if frame.labels is not None:
+                    label = Label.construct(**single_label)  # type: ignore
+                    if label.box2d is not None:
+                        # type: ignore # pylint: disable=line-too-long
+                        label.box2d = Box2D.construct(**label.box2d)
+                    if label.box3d is not None:
+                        # type: ignore # pylint: disable=line-too-long
+                        label.box3d = Box3D.construct(**label.box3d)
+                    if label.poly2d is not None:
+                        label.poly2d = [
+                            # type: ignore # pylint: disable=line-too-long
+                            Poly2D.construct(**p) for p in label.poly2d
+                        ]
+                    if label.rle is not None:
+                        # type: ignore # pylint: disable=line-too-long
+                        label.rle = RLE.construct(**label.rle)
+                    if label.graph is not None:
+                        # type: ignore # pylint: disable=line-too-long
+                        label.graph = Graph.construct(**label.graph)
+                    frame.labels = [label]
+            else:
+                frame = Frame(**raw_frame)
+                frame.labels = [Label(**single_label)]
+                
+            frames.append(frame)
+
+        return frames
 
 
 class SHIFTDataset(Dataset):
@@ -262,21 +361,26 @@ class SHIFTDataset(Dataset):
         split: str,
         keys_to_load: Sequence[str] = (Keys.images, Keys.boxes2d),
         views_to_load: Sequence[str] = ("front",),
+        framerate: str = "images",
+        shift_type: str = "discrete",
         backend: DataBackend = HDF5Backend(),
         num_workers: int = 1,
         verbose: bool = False,
+        classification: bool = False,
         **kwargs
     ) -> None:
         """Initialize SHIFT dataset."""
         # Validate input
         assert split in {"train", "val", "test"}, f"Invalid split '{split}'."
-        self.validate_keys(keys_to_load)
+        # self.validate_keys(keys_to_load)
 
         # Set attributes
         self.data_root = data_root
         self.split = split
         self.keys_to_load = keys_to_load
         self.views_to_load = views_to_load
+        self.framerate = framerate
+        self.shift_type = shift_type
         self.backend = backend
         self.verbose = verbose
         self.ext = _get_extension(backend)
@@ -290,15 +394,19 @@ class SHIFTDataset(Dataset):
                 self.data_root, self.shift_type, self.framerate, self.split
             )
         if self.verbose:
-            logger.info(f"Base: {self.annotation_base}. Backend: {self.backend}")
+            logger.info(
+                f"Base: {self.annotation_base}. Backend: {self.backend}")
 
         # Get the data groups' classes that need to be loaded
-        self._data_groups_to_load = self._get_data_groups(keys_to_load)
+        self._data_groups_to_load = self._get_data_groups(
+            keys_to_load, classification)
         if "det_2d" not in self._data_groups_to_load:
             raise ValueError(
-                "In current implementation, the 'det_2d' data group must be"
+                "In current implementation, the 'det_2d' or 'classification' data groups must be"
                 "loaded to load any other data group."
             )
+        elif len(self._data_groups_to_load) > 1:
+            raise NotImplementedError("Only det_2d label group implemented for classification.")
 
         self.scalabel_datasets = {}
         for view in self.views_to_load:
@@ -340,6 +448,7 @@ class SHIFTDataset(Dataset):
                         backend=backend,
                         num_workers=num_workers,
                         verbose=verbose,
+                        classification=classification,
                         **kwargs
                     )
 
@@ -349,7 +458,7 @@ class SHIFTDataset(Dataset):
             if k not in self.KEYS:
                 raise ValueError(f"Key '{k}' is not supported!")
 
-    def _get_data_groups(self, keys_to_load: Sequence[str]) -> list[str]:
+    def _get_data_groups(self, keys_to_load: Sequence[str], classification: bool) -> list[str]:
         """Get the data groups that need to be loaded from Scalabel."""
         data_groups = []
         for data_group, group_keys in self.DATA_GROUPS.items():
@@ -396,7 +505,8 @@ class SHIFTDataset(Dataset):
         image = image.astype(np.float32)
 
         # Convert to depth
-        depth = image[:, :, 2] * 256 * 256 + image[:, :, 1] * 256 + image[:, :, 0]
+        depth = image[:, :, 2] * 256 * 256 + \
+            image[:, :, 1] * 256 + image[:, :, 0]
         return torch.as_tensor(
             np.ascontiguousarray(depth / max_depth),
             dtype=torch.float32,
@@ -451,7 +561,8 @@ class SHIFTDataset(Dataset):
             if view == "center":
                 # Lidar is only available in the center view
                 if Keys.points3d in self.keys_to_load:
-                    data_dict_view.update(self.scalabel_datasets["center/lidar"][idx])
+                    data_dict_view.update(
+                        self.scalabel_datasets["center/lidar"][idx])
             else:
                 # Load data from Scalabel
                 for group in self._data_groups_to_load:
@@ -476,3 +587,20 @@ class SHIFTDataset(Dataset):
             data_dict[view] = data_dict_view
 
         return data_dict
+
+    @property
+    def video_to_indices(self) -> dict[str, list[int]]:
+        """Group all dataset sample indices (int) by their video ID (str).
+        Returns:
+            dict[str, list[int]]: Mapping video to index.
+        """
+        if len(self.scalabel_datasets) > 0:
+            return self.scalabel_datasets[list(self.scalabel_datasets.keys())[0]].video_to_indices
+        raise ValueError("No Scalabel file has been loaded.")
+
+    def get_video_indices(self, idx: int) -> list[int]:
+        """Get all dataset indices in a video given a single dataset index."""
+        for indices in self.video_to_indices.values():
+            if idx in indices:
+                return indices
+        raise ValueError(f"Dataset index {idx} not found in video_to_indices!")
