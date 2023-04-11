@@ -58,7 +58,7 @@ def load_image(url: str, backend: DataBackend) -> Tensor:
     return torch.as_tensor(
         np.ascontiguousarray(image.transpose(2, 0, 1)),
         dtype=torch.float32,
-    ).unsqueeze(0)
+    ).unsqueeze(0) / 255.0
 
 
 def load_pointcloud(url: str, backend: DataBackend) -> Tensor:
@@ -333,6 +333,14 @@ class Scalabel(Dataset, CacheMappingMixin):
             data[Keys.boxes3d] = boxes3d
             data[Keys.boxes3d_classes] = classes
             data[Keys.boxes3d_track_ids] = track_ids
+
+    def get_classification_target(self, idx: int) -> int:
+        if not self.classification:
+            raise NotImplementedError("This function shoul only be used in classification mode")
+
+        category_name = self.frames[idx].labels[0].category
+        # mapping from class name to class id
+        return self.cats_name2id[Keys.boxes2d][category_name]
 
     def __len__(self) -> int:
         """Length of dataset."""
